@@ -1,0 +1,7 @@
+fastapi[full]
+uvicorn
+sqlalchemy
+asyncpg
+passlib[bcrypt]
+python-jose
+redis
