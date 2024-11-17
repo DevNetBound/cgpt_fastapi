@@ -14,6 +14,8 @@ import uvicorn
 from fastapi.middleware.sessions import SessionMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
 
 # FastAPI app initialization
 app = FastAPI()
@@ -54,6 +56,13 @@ async def get_db():
             yield session  # Yield the session to be used in API route
 
 # Define the database models for users and tenants
+class Tenant(Base):
+    __tablename__ = "tenants"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+
+    users = relationship("User", back_populates="tenant")
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -62,16 +71,7 @@ class User(Base):
     hashed_password = Column(String)
     tenant_id = Column(Integer, ForeignKey("tenants.id"))
 
-    # Relationship to the Tenant model
     tenant = relationship("Tenant", back_populates="users")
-
-class Tenant(Base):
-    __tablename__ = "tenants"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True)
-
-    # Relationship to the User model
-    users = relationship("User", back_populates="tenant")
 
 # Utility functions to hash and verify passwords
 def hash_password(password: str):
@@ -132,36 +132,44 @@ class RedisSessionMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)  # Continue processing the request
         return response
 
-# API Route to create a new tenant and user
-@app.post("/create_tenant/")
-async def create_tenant_and_user(user_create: UserCreate, db: AsyncSession = Depends(get_db)):
-    """
-    Creates a new tenant and user in the database. If the tenant does not
-    already exist, it is created along with the user.
-    """
-    tenant = await db.execute(select(Tenant).filter_by(name=user_create.tenant_name))
-    tenant = tenant.scalar_one_or_none()  # Fetch the tenant or None if not found
-    
-    if not tenant:
-        # If the tenant doesn't exist, create it
-        tenant = Tenant(name=user_create.tenant_name)
-        db.add(tenant)
-        await db.commit()  # Commit the transaction
-    
-    # Hash the user's password before saving it in the database
-    hashed_password = hash_password(user_create.password)
-    
-    # Create a new user and associate it with the tenant
-    new_user = User(username=user_create.username, email=user_create.email,
-                    hashed_password=hashed_password, tenant_id=tenant.id)
-    
-    # Add the user to the session and commit the transaction
-    db.add(new_user)
-    await db.commit()
-    
-    return {"message": "User and tenant created successfully!"}
+# Apply the Redis session management middleware to the app
+app.add_middleware(RedisSessionMiddleware)
 
-# API Route for login (JWT token generation)
+# Pydantic Schemas for Tenant
+class TenantBase(BaseModel):
+    name: str  # Name of the tenant
+
+    class Config:
+        orm_mode = True  # Tells Pydantic to treat the ORM model as a dict for serialization
+
+class TenantResponse(TenantBase):
+    id: int  # The tenant's ID, which is automatically generated in the database
+
+    class Config:
+        orm_mode = True  # This ensures Pydantic models work well with SQLAlchemy models
+
+# API Route to create a new tenant and user
+@app.post("/create_tenant/", response_model=TenantResponse)
+async def create_tenant(tenant_create: TenantBase, db: AsyncSession = Depends(get_db)):
+    """
+    Creates a new tenant in the database.
+    """
+    # Check if the tenant already exists (tenant names must be unique)
+    existing_tenant = await db.execute(select(Tenant).filter_by(name=tenant_create.name))
+    existing_tenant = existing_tenant.scalar_one_or_none()
+    
+    if existing_tenant:
+        raise HTTPException(status_code=400, detail="Tenant already exists")
+    
+    # Create the new tenant
+    new_tenant = Tenant(name=tenant_create.name)
+    db.add(new_tenant)
+    await db.commit()
+    await db.refresh(new_tenant)  # Refresh to get the tenant's id
+    
+    return new_tenant  # Return the tenant, using the TenantResponse model automatically
+
+# API Route to login and generate JWT and session token
 @app.post("/token/")
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
     """
@@ -198,9 +206,6 @@ async def on_startup():
     """
     async with DATABASE_ENGINE.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)  # Create tables
-
-# Apply the Redis session management middleware to the app
-app.add_middleware(RedisSessionMiddleware)
 
 # Route to get current authenticated user
 @app.get("/users/me")
